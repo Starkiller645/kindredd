@@ -74,7 +74,8 @@ void sendall() {
 	int time_now = time(nullptr) - start_time;
 	gamedata["time"] = time_now;
 	cpr::PostAsync(cpr::Url{"https://lamb.jacobtye.dev/livegame"},
-			cpr::Body{gamedata.dump()});
+			cpr::Body{gamedata.dump()},
+			cpr::Header{{"Content-Type", "application/json"}});
 }
 
 void sendupdate() {
@@ -93,14 +94,16 @@ void sendupdate() {
 	std::time_t time_now = time(nullptr);
 	gamedata["time"] = time_now - start_time;
 	cpr::PostAsync(cpr::Url{"https://lamb.jacobtye.dev/livegame"},
-			cpr::Body{gamedata.dump()});
+			cpr::Body{gamedata.dump()},
+			cpr::Header{{"Content-Type", "application/json"}});
 }
 
 void send_game_start() {
 	nlohmann::json gamestart;
 	gamestart["event"] = "start";
 	cpr::PostAsync(cpr::Url{"https://lamb.jacobtye.dev/livegame"},
-			cpr::Body{gamestart.dump()});
+			cpr::Body{gamestart.dump()},
+			cpr::Header{{"Content-Type", "application/json"}});
 }
 
 void send_game_end() {
