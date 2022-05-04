@@ -58,10 +58,9 @@ void log(std::string line) {
 }
 
 bool try_connect() {
-	log("Attempting connection...");
 	auto connection = cpr::GetCallback([&](cpr::Response res) {
 		status = res.status_code;
-		log(std::to_string(int(res.status_code)));
+		
 		if (res.status_code != 0 && res.status_code < 400) {
 			players = nlohmann::json::parse(res.text);
 			cpr::GetCallback([&](cpr::Response res) {
