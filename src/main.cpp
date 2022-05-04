@@ -41,13 +41,27 @@ std::string client_status;
 bool client_online = false;
 std::string client_port;
 std::string client_passwd;
+
+std::vector<std::string> global_log = { "--:--:--] ", "--:--:--] " };
 		
 // Game time is in seconds since the start of the game
 // Game type conforms to the Riot API spec
 
+void log(std::string line) {
+	std::time_t t = std::time(0);
+	std::tm* time_now = std::localtime(&t);
+	std::string hrs = std::to_string(time_now->tm_hour);
+	std::string mins = std::to_string(time_now->tm_min);
+	std::string secs = std::to_string(time_now->tm_sec);
+	std::string time_str = hrs + ":" + mins + ":" + secs;
+	global_log.push_back(time_str + "]" + line);
+}
+
 bool try_connect() {
+	log("Attempting connection...");
 	auto connection = cpr::GetCallback([&](cpr::Response res) {
 		status = res.status_code;
+		log(std::to_string(int(res.status_code)));
 		if (res.status_code != 0 && res.status_code < 400) {
 			players = nlohmann::json::parse(res.text);
 			cpr::GetCallback([&](cpr::Response res) {
@@ -67,7 +81,7 @@ bool try_connect() {
 }
 
 void sendall() {
-	update_current_op = "Sending game metadata";
+	log("Sending game metadata");
 	nlohmann::json gamedata;
 	gamedata["event"] = "metadata";
 	gamedata["ally"] = {};
@@ -86,7 +100,7 @@ void sendall() {
 }
 
 void sendupdate() {
-	update_current_op = "Updating in real-time";
+	log("Updating in real-time");
 	nlohmann::json gamedata;
 	ally_kills = 0;
 	enemy_kills = 0;
@@ -109,7 +123,7 @@ void sendupdate() {
 }
 
 void send_game_start() {
-	update_current_op = "Sending game start notification";
+	log("Sending game start notification");
 	nlohmann::json gamestart;
 	gamestart["event"] = "start";
 	current_json_data = gamestart.dump(4);
@@ -119,7 +133,7 @@ void send_game_start() {
 }
 
 void send_game_end() {
-	update_current_op = "Sending game end notification";
+	log("Sending game end notification");
 	nlohmann::json gameend;
 	gameend["event"] = "end";
 	current_json_data = gameend.dump(4);
@@ -132,9 +146,9 @@ void send_game_end() {
 void update() {
 	while (!do_exit) {
 		std::this_thread::sleep_for(std::chrono::seconds(3));
-		update_t_running = "Connected to update thread!";
+		log("Connected to update thread!");
 		thread_lock = true;
-		client_status = "Getting League Client credentials";
+		log("Getting League Client credentials");
 		client_online = false;
 		ally_champs.clear();
 		enemy_champs.clear();
@@ -142,37 +156,33 @@ void update() {
 		
 		while (!client_online) {
 			std::string client_cred;
-			std::ifstream fh("C:\\Riot Games\\League of Legends\lockfile");
-			try {
-				if (fh.is_open()) {
-					std::string ln;
-					while (std::getline(fh, ln)) {
-						if (ln != "") client_cred = ln;
-					};
-				}
-				else {
-					break;
-				}
-				//std::vector<std::string> creds;
-				//std::stringstream ss(client_cred);
-				//std::string tmp;
-				//while (std::getline(ss, tmp, ':')) {
-				//	creds.push_back(tmp);
-				//}
-				client_port = "39213";//creds[2];
-				client_passwd = "skbiksdniw";//creds[3];
-				client_online = true;
-				client_status = "Found League Client on https://127.0.0.1:" + client_port + "/\n    with authentication riot:" +  client_passwd;
+			std::ifstream fh("C:\\Riot Games\\League of Legends\\lockfile");
+			if (fh.is_open()) {
+				std::string ln;
+				while (std::getline(fh, ln)) {
+					if (ln != "") client_cred = ln;
+				};
 			}
-			catch(...) {
-				//fh.close();
+			else {
 				std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+				continue;
 			}
+			std::vector<std::string> creds;
+			std::stringstream ss(client_cred);
+			std::string tmp;
+			while (std::getline(ss, tmp, ':')) {
+				creds.push_back(tmp);
+			}
+			client_port = creds[2];
+			client_passwd = creds[3];
+			client_online = true;
+			log("with authentication riot : " + client_passwd);
+			log("Found League Client on https://127.0.0.1:" + client_port + "/");
 		}
 
-		while (champ_sel == false) {
+		/*while (champ_sel == false) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-		}
+		}*/
 
 		while (in_game == false) {
 			in_game = try_connect();
@@ -215,7 +225,7 @@ void update() {
 }
 
 int main(int argc, const char* argv[]) {
-	update_t_running = "Waiting for update thread...";
+	log("Waiting for update thread...");
 	update_t = new std::thread(update);
 	auto screen = ScreenInteractive::Fullscreen();
 	int frame = 0;
@@ -228,6 +238,26 @@ int main(int argc, const char* argv[]) {
 	std::string doing_check = "No";
 
 	std::vector<Element> players_disp;
+
+	auto log_buffer = [&] {
+		std::string ln_1 = global_log[global_log.size() - 1];
+		std::string ln_2 = global_log[global_log.size() - 2];
+		std::vector<std::string> ln_1_v;
+		std::vector<std::string> ln_2_v;
+		std::stringstream ss_1(ln_1);
+		std::stringstream ss_2(ln_2);
+		std::string tmp;
+		while (std::getline(ss_1, tmp, ']')) {
+			ln_1_v.push_back(tmp);
+		}
+		while (std::getline(ss_2, tmp, ']')) {
+			ln_2_v.push_back(tmp);
+		}
+		return vbox(
+			hbox(text(ln_1_v[0] + "  "), text(ln_1_v[1]) | color(Color::DarkSeaGreen2)),
+			hbox(text(ln_2_v[0] + "  "), text(ln_2_v[1]) | color(Color::DarkSeaGreen2) | dim)
+		) | border;
+	};
 
 	auto update_players = [&] {
 		players_disp.clear();
@@ -303,8 +333,8 @@ int main(int argc, const char* argv[]) {
 					text("Waiting...") | color(Color::BlueViolet),
 				}),
 				text("Waiting for League of Legends on https://localhost:2999/") | dim,
-				text(update_t_running) | client_status_style,
-				text(client_status) | client_status_style
+				filler(),
+				log_buffer()
 			}));
 		} else {
 			return window(hbox(text("KindredD Monitor") | color(Color::Gold1) | bold, text("")), vbox({
@@ -313,10 +343,7 @@ int main(int argc, const char* argv[]) {
 						update_players(),
 					}),
 					filler(),
-					vbox(
-						render_multiline(current_json_data) | border,
-						hflow(hbox(text("["), spinner(2, frame / 2), text("]")) | dim, text(update_current_op) | color(Color::Purple3))
-					),
+					log_buffer()
 				}));
 		}
 	});
