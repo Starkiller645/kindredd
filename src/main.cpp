@@ -18,15 +18,15 @@
 #include <thread>
 #include "data.hpp"
 
-extern const nlohmann::json champion_data;
 extern const std::string LOGO_K, LOGO_d, LOGO_D;
+extern const std::string champion_data_str;
 
-const std::string version = "v0.3.2";
+const std::string version = "v0.3.3";
 
 #ifdef __linux__
 std::string platform = "Linux (Generic)";
 ftxui::Color platform_color = ftxui::Color::DarkOrange;
-#elif __WIN32
+#elif _WIN32
 std::string platform = "Windows 7/8/10/11";
 ftxui::Color platform_color = ftxui::Color::DodgerBlue1;
 #elif __APPLE__
@@ -39,9 +39,7 @@ ftxui::Color platform_color = ftxui::Color::Red3;
 
 
 #ifdef _MSC_VER
-std::string compiler = "Microsoft Visual Studio (Version ";
-compiler += std::to_string(_MSC_VER);
-compiler += ")";
+std::string compiler = "Microsoft Visual Studio (Version " + std::to_string(_MSC_VER) + ")";
 #elif __clang__
 std::string compiler = "Clang Compiler (Version " + std::to_string(__clang_major__) + "." + std::to_string(__clang_minor__) + "." + std::to_string(__clang_patchlevel__) + ")";
 #elif __GNUC__
@@ -70,7 +68,7 @@ nlohmann::json players;
 nlohmann::json active_player;
 std::time_t start_time;
 std::string ally_teamname;
-nlohmann::json cs_data;
+nlohmann::json cs_data = {{"kindredd", "running"}};
 
 bool client_online = false;
 std::string client_port;
@@ -104,7 +102,7 @@ bool try_connect() {
 	std::future connection = cpr::GetCallback([&](cpr::Response res) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 		status = res.status_code;
-		
+		log(status);
 		if (res.status_code != 0 && res.status_code < 400) {
 			players = nlohmann::json::parse(res.text);
 			cpr::GetCallback([&](cpr::Response res) {
@@ -204,7 +202,6 @@ int champ_select() {
 			return 2;
 		}
 
-
 		nlohmann::json final_json;
 		final_json = {
 			{"event", "picks"},
@@ -266,6 +263,8 @@ int champ_select() {
 }
 
 nlohmann::json get_cmd_opt(std::string commandline) {
+	log("Getting cmdline");
+	std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 	std::regex re("--app-port=([0-9]+)");
 	std::cmatch match;
 	nlohmann::json res = {{"status", "online"}};
@@ -302,10 +301,39 @@ nlohmann::json get_client_data() {
 	}
 #elif _WIN32
 	// Windows-only code for finding the port/password for the client
-	std::string env_root = getenv("SystemRoot");
-	std::string cmdline = env_root + "\\System32\\Wbem\\wmic.exe PROCESS WHERE name='LeagueClientUx.exe' GET commandline"
-	std::iostream wmic = popen(cmdline.c_str());
-	wmic >> res;
+	/*std::string env_root = getenv("SystemRoot");
+	std::string cmdline = env_root + "\\System32\\Wbem\\wmic.exe PROCESS WHERE name='LeagueClientUx.exe' GET commandline";
+	log(cmdline);
+	FILE * wmic = _popen(cmdline.c_str(), "r");
+	std::string output;
+	if (wmic) {
+		std::ostringstream stream;
+		constexpr std::size_t MAX_LN_SZ = 1024;
+		char line[MAX_LN_SZ];
+		while (fgets(line, MAX_LN_SZ, wmic)) stream << line;
+		output = stream.str();
+	}*/
+	std::string cmdline = "powershell \"Get-CimInstance Win32_Process -Filter 'name LIKE ''LeagueClientUx.exe''' | Select CommandLine | ConvertTo-Json\"";
+	FILE* pwsh = _popen(cmdline.c_str(), "r");
+	std::string output;
+	std::string temp;
+	if (pwsh) {
+		std::ostringstream stream;
+		constexpr std::size_t MAX_LN_SZ = 1024;
+		char line[MAX_LN_SZ];
+		while (fgets(line, MAX_LN_SZ, pwsh)) stream << line;
+		temp = stream.str();
+	}
+	log("Got output from PWSH");
+	std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+	try {
+		auto temp_json = nlohmann::json::parse(temp);
+		output = temp_json["CommandLine"];
+	}
+	catch (...) {
+		;
+	}
+
 #endif
 	return get_cmd_opt(output);
 }
@@ -322,6 +350,8 @@ void update() {
 		
 		while (!client_online) {
 			auto cdata = get_client_data();
+			log("CDATA");
+			std::this_thread::sleep_for(std::chrono::milliseconds(2500));
 			if(cdata["status"] == "offline") {
 				std::this_thread::sleep_for(std::chrono::milliseconds(5000));
 				continue;
@@ -348,12 +378,19 @@ void update() {
 		}
 
 		int res = champ_select();
-		if (res != 0) {
-			in_game = false;
-			champ_sel = false;
-			continue;
-		} 
 
+		if(res != 0) {
+			log("Attempting to connect to the game...");
+			for(int i = 0; i < 4; i++) {
+				in_game = try_connect();
+				std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+			}
+			if(!in_game) {
+				champ_sel = false;
+				continue;
+			}
+		}
+		champ_sel = false;
 		while (in_game == false) {
 			in_game = try_connect();
 			std::this_thread::sleep_for(std::chrono::milliseconds(2000));
@@ -395,6 +432,8 @@ void update() {
 }
 
 int main(int argc, const char* argv[]) {
+	std::cout << champion_data_str << std::endl;
+	nlohmann::json champion_data = nlohmann::json::parse(champion_data_str);
 	log("Waiting for update thread...");
 	update_t = new std::thread(update);
 	auto screen = ScreenInteractive::Fullscreen();
@@ -513,53 +552,63 @@ int main(int argc, const char* argv[]) {
 		std::vector<Element> enemy_hovers;
 		std::vector<Element> enemy_picks;
 		for (int i = 0; i < cs_data["ally"]["ban"].size(); i++) {
-			ally_bans.push_back(text(std::string(cs_data["ally"]["ban"][i]["championID"])));
+			ally_bans.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["title"])) | dim));
 		}
+		
 		for (int i = 0; i < cs_data["ally"]["pick"].size(); i++) {
-			ally_picks.push_back(text(std::string(cs_data["ally"]["pick"][i]["championID"])));
+			ally_picks.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["name"])) | color(Color::DodgerBlue1), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["title"])) | dim));
 		}
 		for (int i = 0; i < cs_data["ally"]["hover"].size(); i++) {
-			ally_hovers.push_back(text(std::string(cs_data["ally"]["hover"][i]["championID"])));
+			ally_hovers.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["title"])) | dim));
 		}
 		for (int i = 0; i < cs_data["enemy"]["ban"].size(); i++) {
-			enemy_bans.push_back(text(std::string(cs_data["enemy"]["ban"][i]["championID"])));
+			enemy_bans.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["title"])) | dim));
 		}
 		for (int i = 0; i < cs_data["enemy"]["pick"].size(); i++) {
-			enemy_picks.push_back(text(std::string(cs_data["enemy"]["pick"][i]["championID"])));
+			enemy_picks.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["name"])) | color(Color::DodgerBlue1), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["title"])) | dim));
 		}
 		for (int i = 0; i < cs_data["enemy"]["hover"].size(); i++) {
-			enemy_hovers.push_back(text(std::string(cs_data["enemy"]["hover"][i]["championID"])));
+			enemy_hovers.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["title"])) | dim));
+		}
+		for(int i = 0; i < 5; i++) {
+			if(ally_bans.size() < i) ally_bans.push_back(text(""));
+			if(ally_picks.size() < i) ally_picks.push_back(text(""));
+			if(ally_hovers.size() < i) ally_hovers.push_back(text(""));
+			if(enemy_bans.size() < i) enemy_bans.push_back(text(""));
+			if(enemy_picks.size() < i) enemy_picks.push_back(text(""));
+			if(enemy_hovers.size() < i) enemy_hovers.push_back(text(""));
 		}
 		if(champ_sel) {
-			return vbox(hbox(window(text("Ally") | color(Color::DarkSeaGreen2), 
+			return vbox(hbox(window(hbox(text("Ally"), text("")) | color(Color::DarkSeaGreen2), 
 				vbox(
 					window(text("Bans"),
-						vbox(ally_bans, filler())
-					) | flex,
+						hbox(vbox(ally_bans), filler())
+					),
 					window(text("Hovering"), 
-						vbox(ally_hovers, filler())
-					) | flex,
+						hbox(vbox(ally_hovers), filler())
+					),
 					window(text("Picks"), 
-						vbox(ally_picks, filler())
-					) | flex
-				) | flex
-			), window(text("Enemy") | color(Color::Red3),
+						hbox(vbox(ally_picks), filler())
+					)
+				) | notflex
+			) | flex, window(hbox(text("Enemy"), text("")) | color(Color::Red3),
 				vbox(
 					window(text("Bans"),
-						vbox(enemy_bans, filler())
-					) | flex,
+						hbox(vbox(enemy_bans), filler())
+					),
 					window(text("Hovering"), 
-						vbox(enemy_hovers, filler())
-					) | flex,
+						hbox(vbox(enemy_hovers), filler())
+					),
 					window(text("Picks"), 
-						vbox(enemy_picks, filler())
-					) | flex
-				) | flex
-			)),
+						hbox(vbox(enemy_picks), filler())
+					)
+				) | notflex
+			) | flex),
 			filler());
 		} else {
 			return filler();
 		}
+		return render_multiline(cs_data.dump(4));
 	};
 
 	auto client_status_render = [&] {
@@ -576,7 +625,7 @@ int main(int argc, const char* argv[]) {
 		else {
 			std::string s_text = "Waiting for champion select on https://localhost:" + client_port + "/";
 			return hbox(
-				text("[✔] "),
+				text("[✓] "),
 				text(s_text) | color(Color::DarkSeaGreen2)
 			);
 		}
@@ -594,6 +643,7 @@ int main(int argc, const char* argv[]) {
 				filler(),
 				loading_logo() | center,
 				filler(),
+				log_buffer(),
 				render_debuginfo()
 			)
 		);
@@ -610,12 +660,13 @@ int main(int argc, const char* argv[]) {
 				),
 				client_status_render(),
 				cs_render(),
+				filler(),
 				log_buffer(),
 				render_debuginfo()
 			}));
 		} else {
 			return window(hbox(text("KindredD Monitor") | color(Color::Gold1) | bold, text("")), vbox({
-					text("[✔] League of Legends is running") | color(Color::DarkSeaGreen2),
+					text("[✓] League of Legends is running") | color(Color::DarkSeaGreen2),
 					vbox({
 						update_players(),
 					}),
