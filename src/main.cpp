@@ -1,8 +1,9 @@
-#include <atomic>
+﻿#include <atomic>
 #include <nlohmann/json.hpp>
 #include <cpr/cpr.h>
 #include <iostream>
 #include <fstream>
+#include <regex>
 #include <ftxui/component/captured_mouse.hpp>
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -13,6 +14,41 @@
 #include <signal.h>
 #include <chrono>
 #include <locale>
+#include <sstream>
+#include <thread>
+#include "data.hpp"
+
+extern const nlohmann::json champion_data;
+extern const std::string LOGO_K, LOGO_d, LOGO_D;
+
+const std::string version = "v0.3.2";
+
+#ifdef __linux__
+std::string platform = "Linux (Generic)";
+ftxui::Color platform_color = ftxui::Color::DarkOrange;
+#elif __WIN32
+std::string platform = "Windows 7/8/10/11";
+ftxui::Color platform_color = ftxui::Color::DodgerBlue1;
+#elif __APPLE__
+std::string platform = "Apple MacOS (Darwin)";
+ftxui::Color platform_color = ftxui::Color::Cyan3;
+#else
+std::string platform = "Unknown (Possibly OpenBSD)";
+ftxui::Color platform_color = ftxui::Color::Red3;
+#endif
+
+
+#ifdef _MSC_VER
+std::string compiler = "Microsoft Visual Studio (Version ";
+compiler += std::to_string(_MSC_VER);
+compiler += ")";
+#elif __clang__
+std::string compiler = "Clang Compiler (Version " + std::to_string(__clang_major__) + "." + std::to_string(__clang_minor__) + "." + std::to_string(__clang_patchlevel__) + ")";
+#elif __GNUC__
+std::string compiler = "GNU GCC (Version " + std::to_string(__GNUC__) + "." + std::to_string(__GNUC_MINOR__) + ")";
+#else
+std::string compiler = "Unknown (Possibly MinGW or WebAssembly)";
+#endif
 
 using namespace ftxui;
 
@@ -22,8 +58,6 @@ std::atomic<int> enemy_kills;
 std::vector<std::string> enemy_champs;
 std::atomic<int> game_type;
 std::atomic<int> game_time;
-std::string update_t_running;
-std::string update_current_op;
 std::string current_json_data;
 int status;
 std::atomic<bool> in_game = false;
@@ -36,8 +70,8 @@ nlohmann::json players;
 nlohmann::json active_player;
 std::time_t start_time;
 std::string ally_teamname;
+nlohmann::json cs_data;
 
-std::string client_status;
 bool client_online = false;
 std::string client_port;
 std::string client_passwd;
@@ -57,8 +91,18 @@ void log(std::string line) {
 	global_log.push_back(time_str + "]" + line);
 }
 
+bool send_cs(nlohmann::json json_data) {
+	if (json_data == cs_data) return false;
+	cs_data = json_data;
+	cpr::PostAsync(cpr::Url{ "https://lamb.jacobtye.dev/livegame" },
+		cpr::Body{ json_data.dump() },
+		cpr::Header{ {"Content-Type", "application/json"} });
+	return true;
+}
+
 bool try_connect() {
-	auto connection = cpr::GetCallback([&](cpr::Response res) {
+	std::future connection = cpr::GetCallback([&](cpr::Response res) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 		status = res.status_code;
 		
 		if (res.status_code != 0 && res.status_code < 400) {
@@ -76,6 +120,10 @@ bool try_connect() {
 		}
 		}, cpr::Url{ "https://127.0.0.1:2999/liveclientdata/playerlist" },
 			cpr::VerifySsl(0));
+
+	while (!connection.valid()) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+	}
 	return connection.get();
 }
 
@@ -142,46 +190,169 @@ void send_game_end() {
 	in_game = false;
 }
 
+int champ_select() {
+	bool do_break = false;
+	while (!do_break) {
+		std::string lcu_url = "https://127.0.0.1:" + client_port;
+		auto res = cpr::Get(cpr::Url{ lcu_url + "/lol-champ-select/v1/session" },
+			cpr::Authentication{ "riot", client_passwd },
+			cpr::VerifySsl(0));
+
+		if (res.status_code == 404) {
+			champ_sel = false;
+			log("Returning to queue");
+			return 2;
+		}
+
+
+		nlohmann::json final_json;
+		final_json = {
+			{"event", "picks"},
+			{"time", ""},
+			{"ally", {}},
+			{"enemy", {}}
+		};
+
+		auto json_res = nlohmann::json::parse(res.text);
+		bool doing_bans = true;
+		auto actions = nlohmann::json::parse("[]");
+		for (int i = 0; i < json_res["actions"].size(); i++) {
+			log(std::to_string(i));
+			for (int j = 0; j < json_res["actions"][i].size(); j++) {
+				actions.push_back(json_res["actions"][i][j]);
+			}
+		}
+		for (int i = 0; i < actions.size(); i++) {
+			if (actions[i]["type"] == "pick") doing_bans = false;
+		}
+
+		log("Doing bans");
+		for (int i = 0; i < actions.size(); i++) {
+			auto a = actions[i];
+			std::string team = "enemy";
+			std::string position;
+			if (a["isAllyAction"]) {
+				team = "ally";
+			}
+			if (team == "ally") {
+				for (int j = 0; j < json_res["myTeam"].size(); j++) {
+					if (json_res["myTeam"][j]["cellId"] == a["actorCellId"]) {
+						position = json_res["myTeam"][j]["assignedPosition"];
+					}
+				}
+			}
+			else {
+				for (int j = 0; j < json_res["theirTeam"].size(); j++) {
+					if (json_res["theirTeam"][j]["cellId"] == a["actorCellId"]) {
+						position = json_res["theirTeam"][j]["assignedPosition"];
+					}
+				}
+			}
+			int champID = a["championId"];
+			if (a["completed"]) {
+				final_json[team][std::string(actions[i]["type"])].push_back({
+					{"position", position}, {"championID", champID}
+				});
+			} else if(champID != 0) {
+				final_json[team]["hover"].push_back({
+					{"position", position}, {"championID", champID}
+				});
+			}
+		}
+		send_cs(final_json);
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+	return 0;
+}
+
+nlohmann::json get_cmd_opt(std::string commandline) {
+	std::regex re("--app-port=([0-9]+)");
+	std::cmatch match;
+	nlohmann::json res = {{"status", "online"}};
+	if(std::regex_search(commandline.c_str(), match, re)) {
+		res["port"] = std::string(match[0]).substr(std::string(match[0]).find("=") + 1);
+	} else {
+		res["status"] = "offline";
+	}
+	std::regex pwd("--remoting-auth-token=([a-zA-Z0-9'-_]+)");
+	std::cmatch pwd_match;
+	if(std::regex_search(commandline.c_str(), pwd_match, pwd)) {
+		std::string passwd = std::string(pwd_match[0]).substr(std::string(pwd_match[0]).find("=") + 1);
+		passwd.erase(passwd.find_last_not_of(" \n\r\t")+1);
+		res["password"] = passwd;
+	} else {
+		res["status"] = "offline";
+	}
+	return res;
+}
+
+// This section contains the code for finding port numbers etc.
+nlohmann::json get_client_data() {
+	std::string res;
+#ifdef __unix
+	// UNIX-only code for finding the port/password for the client
+	FILE* ps = popen("ps -Ao cmd | grep LeagueClientUx", "r");
+	std::string output;
+	if(ps) {
+		std::ostringstream stream;
+		constexpr std::size_t MAX_LN_SZ = 1024;
+		char line[MAX_LN_SZ];
+		while(fgets(line, MAX_LN_SZ, ps)) stream << line;
+		output = stream.str();
+	}
+#elif _WIN32
+	// Windows-only code for finding the port/password for the client
+	std::string env_root = getenv("SystemRoot");
+	std::string cmdline = env_root + "\\System32\\Wbem\\wmic.exe PROCESS WHERE name='LeagueClientUx.exe' GET commandline"
+	std::iostream wmic = popen(cmdline.c_str());
+	wmic >> res;
+#endif
+	return get_cmd_opt(output);
+}
+
 void update() {
+	std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+	log("Connected to update thread!");
+	thread_lock = true;
 	while (!do_exit) {
-		std::this_thread::sleep_for(std::chrono::seconds(3));
-		log("Connected to update thread!");
-		thread_lock = true;
-		log("Getting League Client credentials");
-		client_online = false;
 		ally_champs.clear();
 		enemy_champs.clear();
 		in_game = false;
+		champ_sel = false;
 		
 		while (!client_online) {
-			std::string client_cred;
-			std::ifstream fh("C:\\Riot Games\\League of Legends\\lockfile");
-			if (fh.is_open()) {
-				std::string ln;
-				while (std::getline(fh, ln)) {
-					if (ln != "") client_cred = ln;
-				};
-			}
-			else {
+			auto cdata = get_client_data();
+			if(cdata["status"] == "offline") {
 				std::this_thread::sleep_for(std::chrono::milliseconds(5000));
 				continue;
 			}
-			std::vector<std::string> creds;
-			std::stringstream ss(client_cred);
-			std::string tmp;
-			while (std::getline(ss, tmp, ':')) {
-				creds.push_back(tmp);
-			}
-			client_port = creds[2];
-			client_passwd = creds[3];
+
+			client_port = cdata["port"];
+			client_passwd = cdata["password"];
 			client_online = true;
-			log("with authentication riot : " + client_passwd);
+			log("with authentication riot:" + client_passwd);
 			log("Found League Client on https://127.0.0.1:" + client_port + "/");
+			break;
 		}
 
-		/*while (champ_sel == false) {
+		std::string lcu_url = "https://127.0.0.1:" + client_port;
+		while (!champ_sel) {
+			auto res = cpr::Get(cpr::Url{ lcu_url + "/lol-champ-select/v1/session" },
+				cpr::Authentication{ "riot", client_passwd },
+				cpr::VerifySsl(0));
+			if (res.status_code == 200) {
+				champ_sel = true;
+				break;
+			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-		}*/
+		}
+
+		int res = champ_select();
+		if (res != 0) {
+			in_game = false;
+			champ_sel = false;
+			continue;
+		} 
 
 		while (in_game == false) {
 			in_game = try_connect();
@@ -237,6 +408,22 @@ int main(int argc, const char* argv[]) {
 	std::string doing_check = "No";
 
 	std::vector<Element> players_disp;
+
+	auto render_debuginfo = [&] {
+		return vbox(
+			hbox(
+				text("KindredD Version "),
+				text(version) | color(Color::Gold1),
+				text(" running on platform "),
+				text(platform) | color(platform_color)
+			),
+			hbox(
+				text(" * ") | color(Color::Gold1),
+				text("Compiled with "),
+				text(compiler) | color(Color::BlueViolet)
+			)
+		);
+	};
 
 	auto log_buffer = [&] {
 		std::string ln_1 = global_log[global_log.size() - 1];
@@ -308,6 +495,93 @@ int main(int argc, const char* argv[]) {
 		return vbox(els);
 	};
 
+	auto loading_logo = [&] {
+		return vbox(
+			hbox(
+				render_multiline(LOGO_NAME),
+				render_multiline(LOGO_D) | color(Color::Gold1)
+			) | border | center,
+			hbox(text("["), spinner(2, frame / 2), text("]")) | center
+		) | center;
+	};
+
+	auto cs_render = [&]() {
+		std::vector<Element> ally_bans;
+		std::vector<Element> ally_hovers;
+		std::vector<Element> ally_picks;
+		std::vector<Element> enemy_bans;
+		std::vector<Element> enemy_hovers;
+		std::vector<Element> enemy_picks;
+		for (int i = 0; i < cs_data["ally"]["ban"].size(); i++) {
+			ally_bans.push_back(text(std::string(cs_data["ally"]["ban"][i]["championID"])));
+		}
+		for (int i = 0; i < cs_data["ally"]["pick"].size(); i++) {
+			ally_picks.push_back(text(std::string(cs_data["ally"]["pick"][i]["championID"])));
+		}
+		for (int i = 0; i < cs_data["ally"]["hover"].size(); i++) {
+			ally_hovers.push_back(text(std::string(cs_data["ally"]["hover"][i]["championID"])));
+		}
+		for (int i = 0; i < cs_data["enemy"]["ban"].size(); i++) {
+			enemy_bans.push_back(text(std::string(cs_data["enemy"]["ban"][i]["championID"])));
+		}
+		for (int i = 0; i < cs_data["enemy"]["pick"].size(); i++) {
+			enemy_picks.push_back(text(std::string(cs_data["enemy"]["pick"][i]["championID"])));
+		}
+		for (int i = 0; i < cs_data["enemy"]["hover"].size(); i++) {
+			enemy_hovers.push_back(text(std::string(cs_data["enemy"]["hover"][i]["championID"])));
+		}
+		if(champ_sel) {
+			return vbox(hbox(window(text("Ally") | color(Color::DarkSeaGreen2), 
+				vbox(
+					window(text("Bans"),
+						vbox(ally_bans, filler())
+					) | flex,
+					window(text("Hovering"), 
+						vbox(ally_hovers, filler())
+					) | flex,
+					window(text("Picks"), 
+						vbox(ally_picks, filler())
+					) | flex
+				) | flex
+			), window(text("Enemy") | color(Color::Red3),
+				vbox(
+					window(text("Bans"),
+						vbox(enemy_bans, filler())
+					) | flex,
+					window(text("Hovering"), 
+						vbox(enemy_hovers, filler())
+					) | flex,
+					window(text("Picks"), 
+						vbox(enemy_picks, filler())
+					) | flex
+				) | flex
+			)),
+			filler());
+		} else {
+			return filler();
+		}
+	};
+
+	auto client_status_render = [&] {
+		if (!client_online) {
+			std::string s_text;
+			s_text = "Waiting for League Client to start";
+			return hbox(
+				text("["),
+				spinner(2, frame / 2),
+				text("] "),
+				text(s_text) | dim
+			);
+		}
+		else {
+			std::string s_text = "Waiting for champion select on https://localhost:" + client_port + "/";
+			return hbox(
+				text("[✔] "),
+				text(s_text) | color(Color::DarkSeaGreen2)
+			);
+		}
+	};
+
 	auto main_render = Renderer([&] {
 		if(status != 0) {
 			have_connection = true;
@@ -315,34 +589,39 @@ int main(int argc, const char* argv[]) {
 			have_connection = false;
 		}
 
-		auto client_status_style = color(Color::Purple3) | dim;
-		if (client_online) {
-			client_status_style = color(Color::Purple3);
+		if(!thread_lock) {
+			return window(hbox(text("KindredD Monitor") | color(Color::Gold1) | bold, text("")), vbox(
+				filler(),
+				loading_logo() | center,
+				filler(),
+				render_debuginfo()
+			)
+		);
 		}
-		auto update_t_style = color(Color::Purple3) | dim;
-		if (thread_lock) {
-			update_t_style = color(Color::Purple3);
-		}
+
 		if(!in_game) {
 			return window(hbox(text("KindredD Monitor") | color(Color::Gold1) | bold, text("")), vbox({
-				hbox({
+				text("Waiting...") | color(Color::BlueViolet),
+				hbox(
 					text("["),
 					spinner(2, frame / 2),
 					text("] "),
-					text("Waiting...") | color(Color::BlueViolet),
-				}),
-				text("Waiting for League of Legends on https://localhost:2999/") | dim,
-				filler(),
-				log_buffer()
+					text("Waiting for League of Legends on https://localhost:2999/") | dim
+				),
+				client_status_render(),
+				cs_render(),
+				log_buffer(),
+				render_debuginfo()
 			}));
 		} else {
 			return window(hbox(text("KindredD Monitor") | color(Color::Gold1) | bold, text("")), vbox({
-					text("League of Legends is running"),
+					text("[✔] League of Legends is running") | color(Color::DarkSeaGreen2),
 					vbox({
 						update_players(),
 					}),
 					filler(),
-					log_buffer()
+					log_buffer(),
+					render_debuginfo()
 				}));
 		}
 	});
