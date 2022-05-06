@@ -21,7 +21,9 @@
 extern const std::string LOGO_K, LOGO_d, LOGO_D;
 extern const std::string champion_data_str;
 
-const std::string version = "v0.3.3";
+sig_atomic_t signalled = 0;
+
+const std::string version = "v0.4.0";
 
 #ifdef __linux__
 std::string platform = "Linux (Generic)";
@@ -61,6 +63,8 @@ int status;
 std::atomic<bool> in_game = false;
 std::atomic<bool> do_exit = false;
 std::atomic<bool> champ_sel = false;
+std::atomic<bool> program_break = false;
+bool loading = true;
 
 std::thread *update_t;
 bool thread_lock = false;
@@ -89,6 +93,24 @@ void log(std::string line) {
 	global_log.push_back(time_str + "]" + line);
 }
 
+#ifdef __unix
+#include <cstdlib>
+void handle_sigint(int s) {
+	program_break = true;
+	while(true) {
+		if(!thread_lock) {
+			update_t->join();
+			signalled = 1;
+			// Reset DEC codes that FTXUI sets for mouse input
+			std::system("echo -e '\x1b[?1000;1003;1005l'");
+			std::cout << std::endl;
+			exit(0);
+		}
+	}
+}
+#elif _WIN32
+#endif
+
 bool send_cs(nlohmann::json json_data) {
 	if (json_data == cs_data) return false;
 	cs_data = json_data;
@@ -98,11 +120,15 @@ bool send_cs(nlohmann::json json_data) {
 	return true;
 }
 
+bool t_check(int msecs) {
+	std::this_thread::sleep_for(std::chrono::milliseconds(msecs));
+	return program_break;
+};
+
 bool try_connect() {
 	std::future connection = cpr::GetCallback([&](cpr::Response res) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		if(t_check(200));
 		status = res.status_code;
-		log(status);
 		if (res.status_code != 0 && res.status_code < 400) {
 			players = nlohmann::json::parse(res.text);
 			cpr::GetCallback([&](cpr::Response res) {
@@ -120,7 +146,7 @@ bool try_connect() {
 			cpr::VerifySsl(0));
 
 	while (!connection.valid()) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		if(t_check(500));
 	}
 	return connection.get();
 }
@@ -145,7 +171,6 @@ void sendall() {
 }
 
 void sendupdate() {
-	log("Updating in real-time");
 	nlohmann::json gamedata;
 	ally_kills = 0;
 	enemy_kills = 0;
@@ -214,7 +239,6 @@ int champ_select() {
 		bool doing_bans = true;
 		auto actions = nlohmann::json::parse("[]");
 		for (int i = 0; i < json_res["actions"].size(); i++) {
-			log(std::to_string(i));
 			for (int j = 0; j < json_res["actions"][i].size(); j++) {
 				actions.push_back(json_res["actions"][i][j]);
 			}
@@ -223,7 +247,6 @@ int champ_select() {
 			if (actions[i]["type"] == "pick") doing_bans = false;
 		}
 
-		log("Doing bans");
 		for (int i = 0; i < actions.size(); i++) {
 			auto a = actions[i];
 			std::string team = "enemy";
@@ -248,23 +271,21 @@ int champ_select() {
 			int champID = a["championId"];
 			if (a["completed"]) {
 				final_json[team][std::string(actions[i]["type"])].push_back({
-					{"position", position}, {"championID", champID}
+					{"position", position}, {"championID", champID}, {"type", std::string(actions[i]["type"])}
 				});
 			} else if(champID != 0) {
 				final_json[team]["hover"].push_back({
-					{"position", position}, {"championID", champID}
+					{"position", position}, {"championID", champID}, {"type", std::string(actions[i]["type"])}
 				});
 			}
 		}
 		send_cs(final_json);
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		if(t_check(250));
 	}
 	return 0;
 }
 
 nlohmann::json get_cmd_opt(std::string commandline) {
-	log("Getting cmdline");
-	std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 	std::regex re("--app-port=([0-9]+)");
 	std::cmatch match;
 	nlohmann::json res = {{"status", "online"}};
@@ -301,6 +322,7 @@ nlohmann::json get_client_data() {
 	}
 #elif _WIN32
 	// Windows-only code for finding the port/password for the client
+	// Deprecated in favour of using PowerShell
 	/*std::string env_root = getenv("SystemRoot");
 	std::string cmdline = env_root + "\\System32\\Wbem\\wmic.exe PROCESS WHERE name='LeagueClientUx.exe' GET commandline";
 	log(cmdline);
@@ -324,8 +346,6 @@ nlohmann::json get_client_data() {
 		while (fgets(line, MAX_LN_SZ, pwsh)) stream << line;
 		temp = stream.str();
 	}
-	log("Got output from PWSH");
-	std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 	try {
 		auto temp_json = nlohmann::json::parse(temp);
 		output = temp_json["CommandLine"];
@@ -339,8 +359,12 @@ nlohmann::json get_client_data() {
 }
 
 void update() {
-	std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+	if(t_check(2500)) {
+		thread_lock = false;	
+		return;
+	}
 	log("Connected to update thread!");
+	loading = false;
 	thread_lock = true;
 	while (!do_exit) {
 		ally_champs.clear();
@@ -350,10 +374,15 @@ void update() {
 		
 		while (!client_online) {
 			auto cdata = get_client_data();
-			log("CDATA");
-			std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+			if(t_check(2500)) {
+				thread_lock = false;	
+				return;
+			}
 			if(cdata["status"] == "offline") {
-				std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+				if(t_check(5000)) {
+					thread_lock = false;	
+					return;
+				}
 				continue;
 			}
 
@@ -374,7 +403,10 @@ void update() {
 				champ_sel = true;
 				break;
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+			if(t_check(2000)) {
+				thread_lock = false;	
+				return;
+			}
 		}
 
 		int res = champ_select();
@@ -383,7 +415,10 @@ void update() {
 			log("Attempting to connect to the game...");
 			for(int i = 0; i < 4; i++) {
 				in_game = try_connect();
-				std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+				if(t_check(2000)) {
+					thread_lock = false;	
+					return;
+				}
 			}
 			if(!in_game) {
 				champ_sel = false;
@@ -393,7 +428,10 @@ void update() {
 		champ_sel = false;
 		while (in_game == false) {
 			in_game = try_connect();
-			std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+			if(t_check(2000)) {
+				thread_lock = false;	
+				return;
+			};
 		}
 
 		if (in_game) {
@@ -417,7 +455,10 @@ void update() {
 			int gt = 0;
 			while (true) {
 				sendupdate();
-				std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+				if(t_check(1000)) {
+					thread_lock = false;	
+					return;
+				};
 				gt += 1;
 				if (gt % 5 == 0) {
 					do_break = !try_connect();
@@ -432,10 +473,15 @@ void update() {
 }
 
 int main(int argc, const char* argv[]) {
-	std::cout << champion_data_str << std::endl;
-	nlohmann::json champion_data = nlohmann::json::parse(champion_data_str);
+	loading = true;
 	log("Waiting for update thread...");
 	update_t = new std::thread(update);
+	struct sigaction sa;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_handler = handle_sigint;
+	sa.sa_flags = 0;
+	signal(SIGINT, handle_sigint);
+	nlohmann::json champion_data = nlohmann::json::parse(champion_data_str);
 	auto screen = ScreenInteractive::Fullscreen();
 	int frame = 0;
 	int status = 0;
@@ -447,6 +493,10 @@ int main(int argc, const char* argv[]) {
 	std::string doing_check = "No";
 
 	std::vector<Element> players_disp;
+
+	auto spinbox = [&] {
+		return hbox(text("["), spinner(2, frame / 2), text("] "));
+	};
 
 	auto render_debuginfo = [&] {
 		return vbox(
@@ -539,44 +589,62 @@ int main(int argc, const char* argv[]) {
 			hbox(
 				render_multiline(LOGO_NAME),
 				render_multiline(LOGO_D) | color(Color::Gold1)
-			) | border | center,
-			hbox(text("["), spinner(2, frame / 2), text("]")) | center
+			) | border | center
 		) | center;
 	};
 
 	auto cs_render = [&]() {
 		std::vector<Element> ally_bans;
-		std::vector<Element> ally_hovers;
 		std::vector<Element> ally_picks;
 		std::vector<Element> enemy_bans;
-		std::vector<Element> enemy_hovers;
 		std::vector<Element> enemy_picks;
+
+		auto ban_spinner = [&] (bool locked) {
+			auto ctr = spinner(2, frame / 2) | color(Color::Red3);
+			if(locked) ctr = text("✓") | color(Color::Red3);
+			return hbox(text("["), ctr, text("] "));
+		};
+
+		auto pick_spinner = [&] (bool locked) {
+			auto ctr = spinner(2, frame / 2) | color(Color::DarkSeaGreen2);
+			if(locked) ctr = text("✓") | color(Color::DarkSeaGreen2);
+			return hbox(text("["), ctr, text("] "));
+		};
+
 		for (int i = 0; i < cs_data["ally"]["ban"].size(); i++) {
-			ally_bans.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["title"])) | dim));
+			ally_bans.push_back(hbox(ban_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["title"]))));
 		}
 		
 		for (int i = 0; i < cs_data["ally"]["pick"].size(); i++) {
-			ally_picks.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["name"])) | color(Color::DodgerBlue1), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["title"])) | dim));
+			ally_picks.push_back(hbox(pick_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["name"])) | color(Color::DarkSeaGreen2), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["title"]))));
 		}
 		for (int i = 0; i < cs_data["ally"]["hover"].size(); i++) {
-			ally_hovers.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["title"])) | dim));
+			if(cs_data["ally"]["hover"][i]["type"] == "ban") {
+				ally_bans.push_back(hbox(ban_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["title"])) | dim));
+
+			} else {
+				ally_picks.push_back(hbox(pick_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["title"])) | dim));
+			}
 		}
 		for (int i = 0; i < cs_data["enemy"]["ban"].size(); i++) {
-			enemy_bans.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["title"])) | dim));
+			enemy_bans.push_back(hbox(ban_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["title"]))));
 		}
 		for (int i = 0; i < cs_data["enemy"]["pick"].size(); i++) {
-			enemy_picks.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["name"])) | color(Color::DodgerBlue1), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["title"])) | dim));
+			enemy_picks.push_back(hbox(pick_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["name"])) | color(Color::DarkSeaGreen2), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["title"]))));
 		}
 		for (int i = 0; i < cs_data["enemy"]["hover"].size(); i++) {
-			enemy_hovers.push_back(hbox(text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["title"])) | dim));
+			if(std::string(cs_data["enemy"]["hover"][i]["type"]) == "ban") {
+				enemy_bans.push_back(hbox(ban_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["title"])) | dim));
+
+			} else {
+				enemy_picks.push_back(hbox(pick_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["title"])) | dim));
+			}
 		}
-		for(int i = 0; i < 5; i++) {
-			if(ally_bans.size() < i) ally_bans.push_back(text(""));
-			if(ally_picks.size() < i) ally_picks.push_back(text(""));
-			if(ally_hovers.size() < i) ally_hovers.push_back(text(""));
-			if(enemy_bans.size() < i) enemy_bans.push_back(text(""));
-			if(enemy_picks.size() < i) enemy_picks.push_back(text(""));
-			if(enemy_hovers.size() < i) enemy_hovers.push_back(text(""));
+		for(int i = 0; i <= 5; i++) {
+			if(ally_bans.size() < i) ally_bans.push_back(text("                                         "));
+			if(ally_picks.size() < i) ally_picks.push_back(text("                                         "));
+			if(enemy_bans.size() < i) enemy_bans.push_back(text("                                         "));
+			if(enemy_picks.size() < i) enemy_picks.push_back(text("                                         "));
 		}
 		if(champ_sel) {
 			return vbox(hbox(window(hbox(text("Ally"), text("")) | color(Color::DarkSeaGreen2), 
@@ -584,24 +652,20 @@ int main(int argc, const char* argv[]) {
 					window(text("Bans"),
 						hbox(vbox(ally_bans), filler())
 					),
-					window(text("Hovering"), 
-						hbox(vbox(ally_hovers), filler())
-					),
 					window(text("Picks"), 
 						hbox(vbox(ally_picks), filler())
-					)
+					),
+					filler()
 				) | notflex
 			) | flex, window(hbox(text("Enemy"), text("")) | color(Color::Red3),
 				vbox(
 					window(text("Bans"),
 						hbox(vbox(enemy_bans), filler())
 					),
-					window(text("Hovering"), 
-						hbox(vbox(enemy_hovers), filler())
-					),
 					window(text("Picks"), 
 						hbox(vbox(enemy_picks), filler())
-					)
+					),
+					filler()
 				) | notflex
 			) | flex),
 			filler());
@@ -612,23 +676,32 @@ int main(int argc, const char* argv[]) {
 	};
 
 	auto client_status_render = [&] {
-		if (!client_online) {
-			std::string s_text;
-			s_text = "Waiting for League Client to start";
-			return hbox(
-				text("["),
-				spinner(2, frame / 2),
-				text("] "),
-				text(s_text) | dim
-			);
+
+		std::vector<Element> els;
+
+		if(!client_online) {
+			els.push_back(hbox(spinbox(), text("Waiting for League Client to start")));
+			els.push_back(hbox(text("  ["), text("*") | color(Color::Gold3Bis), text("] Waiting for champion select                              ") | dim, text("League Client not started yet") | color(Color::Gold3Bis) | dim));
+			els.push_back(hbox(text("  ["), text("*") | color(Color::Gold3Bis), text("] Waiting for League of Legends on https://localhost:2999/ ") | dim, text("League Client not started yet") | color(Color::Gold3Bis) | dim));
+		} else {
+			els.push_back(hbox(text("[✓] League Client running on https://127.0.0.1:" + client_port + "/")) | color(Color::DarkSeaGreen2));
+			if(!champ_sel) {
+				if(!in_game) {
+					els.push_back(hbox(text("  "), spinbox(), text("Waiting for champion select")));
+				} else {
+					els.push_back(hbox(text("  ["), text("*") | color(Color::Gold3Bis), text("] Waiting for champion select ") | dim, text("Currently in-game") | color(Color::Gold3Bis) | dim));
+				}
+			} else {
+				els.push_back(text("  [✓] Connected to champion select") | color(Color::DarkSeaGreen2));
+			}
+			if(in_game) {
+				els.push_back(text("  [✓] League of Legends is running") | color(Color::DarkSeaGreen2));
+			} else {
+				els.push_back(hbox(text("  "), spinbox(), text("Waiting for League of Legends on https://localhost:2999/")));
+			}
 		}
-		else {
-			std::string s_text = "Waiting for champion select on https://localhost:" + client_port + "/";
-			return hbox(
-				text("[✓] "),
-				text(s_text) | color(Color::DarkSeaGreen2)
-			);
-		}
+
+		return vbox(els);
 	};
 
 	auto main_render = Renderer([&] {
@@ -638,10 +711,22 @@ int main(int argc, const char* argv[]) {
 			have_connection = false;
 		}
 
-		if(!thread_lock) {
+		if(program_break) {
 			return window(hbox(text("KindredD Monitor") | color(Color::Gold1) | bold, text("")), vbox(
 				filler(),
 				loading_logo() | center,
+				hbox(text("["), spinner(2, frame / 2), text("]")) | center,
+				text("Waiting for update thread to shutdown...") | dim,
+				filler(),
+				log_buffer(),
+				render_debuginfo()
+			));
+		}
+		if(loading) {
+			return window(hbox(text("KindredD Monitor") | color(Color::Gold1) | bold, text("")), vbox(
+				filler(),
+				loading_logo() | center,
+				spinbox() | center,
 				filler(),
 				log_buffer(),
 				render_debuginfo()
@@ -652,12 +737,6 @@ int main(int argc, const char* argv[]) {
 		if(!in_game) {
 			return window(hbox(text("KindredD Monitor") | color(Color::Gold1) | bold, text("")), vbox({
 				text("Waiting...") | color(Color::BlueViolet),
-				hbox(
-					text("["),
-					spinner(2, frame / 2),
-					text("] "),
-					text("Waiting for League of Legends on https://localhost:2999/") | dim
-				),
 				client_status_render(),
 				cs_render(),
 				filler(),
@@ -666,7 +745,7 @@ int main(int argc, const char* argv[]) {
 			}));
 		} else {
 			return window(hbox(text("KindredD Monitor") | color(Color::Gold1) | bold, text("")), vbox({
-					text("[✓] League of Legends is running") | color(Color::DarkSeaGreen2),
+					client_status_render(),
 					vbox({
 						update_players(),
 					}),
@@ -678,6 +757,7 @@ int main(int argc, const char* argv[]) {
 	});
 	bool refresh_ui_continue = true;
 	std::thread refresh_ui([&] {
+		signal(SIGINT, handle_sigint);
 	    	while (refresh_ui_continue) {
 			using namespace std::chrono_literals;
 			std::this_thread::sleep_for(0.05s);
