@@ -1,4 +1,5 @@
 ﻿#include <atomic>
+#define JSON_DIAGNOSTICS 1
 #include <nlohmann/json.hpp>
 #include <cpr/cpr.h>
 #include <iostream>
@@ -16,6 +17,12 @@
 #include <locale>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
+
+#ifdef __unix
+#include <unistd.h>
+#endif
+
 #include "data.hpp"
 
 extern const std::string LOGO_K, LOGO_d, LOGO_D;
@@ -23,7 +30,7 @@ extern const std::string champion_data_str;
 
 sig_atomic_t signalled = 0;
 
-const std::string version = "v0.4.0";
+const std::string version = "v0.4.4";
 
 #ifdef __linux__
 std::string platform = "Linux (Generic)";
@@ -51,6 +58,15 @@ std::string compiler = "Unknown (Possibly MinGW or WebAssembly)";
 #endif
 
 using namespace ftxui;
+
+std::map<std::string, std::string> positions = {
+	{"top", "[💪]"},
+	{"jungle", "[🌲]"},
+	{"middle", "[🪄]"},
+	{"bottom", "[🏹]"},
+	{"utility", "[💚]"},
+	{"", ""}
+};
 
 std::atomic<int> ally_kills;
 std::vector<std::string> ally_champs;
@@ -216,6 +232,7 @@ void send_game_end() {
 int champ_select() {
 	bool do_break = false;
 	while (!do_break) {
+		log("Requesting new data");
 		std::string lcu_url = "https://127.0.0.1:" + client_port;
 		auto res = cpr::Get(cpr::Url{ lcu_url + "/lol-champ-select/v1/session" },
 			cpr::Authentication{ "riot", client_passwd },
@@ -236,21 +253,30 @@ int champ_select() {
 		};
 
 		auto json_res = nlohmann::json::parse(res.text);
-		bool doing_bans = true;
 		auto actions = nlohmann::json::parse("[]");
 		for (int i = 0; i < json_res["actions"].size(); i++) {
 			for (int j = 0; j < json_res["actions"][i].size(); j++) {
 				actions.push_back(json_res["actions"][i][j]);
 			}
 		}
-		for (int i = 0; i < actions.size(); i++) {
-			if (actions[i]["type"] == "pick") doing_bans = false;
+
+		std::map<int, int> my_team, enemy_team;
+
+		for(int i = 0; i < json_res["myTeam"].size(); i++) {
+			auto data = json_res["myTeam"][i];
+			my_team[data["cellId"]] = i;
+		}
+
+		for(int i = 0; i < json_res["theirTeam"].size(); i++) {
+			auto data = json_res["theirTeam"][i];
+			enemy_team[data["cellId"]] = i;
 		}
 
 		for (int i = 0; i < actions.size(); i++) {
 			auto a = actions[i];
 			std::string team = "enemy";
 			std::string position;
+			int id_i;
 			if (a["isAllyAction"]) {
 				team = "ally";
 			}
@@ -269,15 +295,22 @@ int champ_select() {
 				}
 			}
 			int champID = a["championId"];
+			int cellID;
+			if(team == "ally") {
+				cellID = my_team[a["actorCellId"]];
+			} else {
+				cellID = enemy_team[a["actorCellId"]];
+			}
 			if (a["completed"]) {
 				final_json[team][std::string(actions[i]["type"])].push_back({
-					{"position", position}, {"championID", champID}, {"type", std::string(actions[i]["type"])}
+					{"position", position}, {"championID", champID}, {"type", std::string(actions[i]["type"])}, {"cellID", cellID}
 				});
 			} else if(champID != 0) {
 				final_json[team]["hover"].push_back({
-					{"position", position}, {"championID", champID}, {"type", std::string(actions[i]["type"])}
+					{"position", position}, {"championID", champID}, {"type", std::string(actions[i]["type"])}, {"cellID", cellID}
 				});
 			}
+
 		}
 		send_cs(final_json);
 		if(t_check(250));
@@ -322,7 +355,7 @@ nlohmann::json get_client_data() {
 	}
 #elif _WIN32
 	// Windows-only code for finding the port/password for the client
-	// Deprecated in favour of using PowerShell
+	// Below commented code is deprecated in favour of using PowerShell
 	/*std::string env_root = getenv("SystemRoot");
 	std::string cmdline = env_root + "\\System32\\Wbem\\wmic.exe PROCESS WHERE name='LeagueClientUx.exe' GET commandline";
 	log(cmdline);
@@ -482,6 +515,8 @@ int main(int argc, const char* argv[]) {
 	sa.sa_flags = 0;
 	signal(SIGINT, handle_sigint);
 	nlohmann::json champion_data = nlohmann::json::parse(champion_data_str);
+	//std::cout << champion_data.dump(4) << std::endl;
+	//return 0;
 	auto screen = ScreenInteractive::Fullscreen();
 	int frame = 0;
 	int status = 0;
@@ -594,10 +629,10 @@ int main(int argc, const char* argv[]) {
 	};
 
 	auto cs_render = [&]() {
-		std::vector<Element> ally_bans;
-		std::vector<Element> ally_picks;
-		std::vector<Element> enemy_bans;
-		std::vector<Element> enemy_picks;
+		std::vector<Element> ally_bans = {text("                                         "), text("                                         "), text("                                         "), text("                                         "), text("                                         ")};
+		std::vector<Element> ally_picks = {text("                                         "), text("                                         "), text("                                         "), text("                                         "), text("                                         ")};
+		std::vector<Element> enemy_bans = {text("                                         "), text("                                         "), text("                                         "), text("                                         "), text("                                         ")};
+		std::vector<Element> enemy_picks = {text("                                         "), text("                                         "), text("                                         "), text("                                         "), text("                                         ")};
 
 		auto ban_spinner = [&] (bool locked) {
 			auto ctr = spinner(2, frame / 2) | color(Color::Red3);
@@ -612,40 +647,36 @@ int main(int argc, const char* argv[]) {
 		};
 
 		for (int i = 0; i < cs_data["ally"]["ban"].size(); i++) {
-			ally_bans.push_back(hbox(ban_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["title"]))));
+			ally_bans[cs_data["ally"]["ban"][i]["cellID"]] = hbox(ban_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["ban"][i]["championID"]))]["title"])), filler(), text(positions[cs_data["ally"]["ban"][i]["position"]] + " ") | dim, text(positions[cs_data["ally"]["ban"][i]["position"]]));
 		}
 		
 		for (int i = 0; i < cs_data["ally"]["pick"].size(); i++) {
-			ally_picks.push_back(hbox(pick_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["name"])) | color(Color::DarkSeaGreen2), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["title"]))));
+			ally_picks[cs_data["ally"]["pick"][i]["cellID"]] = hbox(pick_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["name"])) | color(Color::DarkSeaGreen2), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["pick"][i]["championID"]))]["title"])), filler(), text(positions[cs_data["ally"]["pick"][i]["position"]] + " ") | dim, text(positions[cs_data["ally"]["pick"][i]["position"]]));
 		}
 		for (int i = 0; i < cs_data["ally"]["hover"].size(); i++) {
 			if(cs_data["ally"]["hover"][i]["type"] == "ban") {
-				ally_bans.push_back(hbox(ban_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["title"])) | dim));
+				ally_bans[cs_data["ally"]["hover"][i]["cellID"]] = hbox(ban_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["title"])) | dim, filler(), text(positions[cs_data["ally"]["hover"][i]["position"]] + " ") | dim, text(positions[cs_data["ally"]["hover"][i]["position"]]));
 
 			} else {
-				ally_picks.push_back(hbox(pick_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["title"])) | dim));
+				ally_picks[cs_data["ally"]["hover"][i]["cellID"]] = hbox(pick_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["ally"]["hover"][i]["championID"]))]["title"])) | dim, filler(), text(positions[cs_data["ally"]["hover"][i]["position"]] + " ") | dim, text(positions[cs_data["ally"]["hover"][i]["position"]]));
 			}
 		}
 		for (int i = 0; i < cs_data["enemy"]["ban"].size(); i++) {
-			enemy_bans.push_back(hbox(ban_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["title"]))));
+			enemy_bans[cs_data["enemy"]["ban"][i]["cellID"]] = hbox(ban_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["name"])) | color(Color::Red3), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["ban"][i]["championID"]))]["title"])), filler(), text(positions[cs_data["enemy"]["ban"][i]["position"]] + " ") | dim, text(positions[cs_data["enemy"]["ban"][i]["position"]]));
 		}
+		
 		for (int i = 0; i < cs_data["enemy"]["pick"].size(); i++) {
-			enemy_picks.push_back(hbox(pick_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["name"])) | color(Color::DarkSeaGreen2), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["title"]))));
+			enemy_picks[cs_data["enemy"]["pick"][i]["cellID"]] = hbox(pick_spinner(true), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["name"])) | color(Color::DarkSeaGreen2), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["pick"][i]["championID"]))]["title"])), filler(), text(positions[cs_data["enemy"]["pick"][i]["position"]] + " ") | dim, text(positions[cs_data["enemy"]["pick"][i]["position"]]));
 		}
 		for (int i = 0; i < cs_data["enemy"]["hover"].size(); i++) {
-			if(std::string(cs_data["enemy"]["hover"][i]["type"]) == "ban") {
-				enemy_bans.push_back(hbox(ban_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["title"])) | dim));
+			if(cs_data["enemy"]["hover"][i]["type"] == "ban") {
+				enemy_bans[cs_data["enemy"]["hover"][i]["cellID"]] = hbox(ban_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["title"])) | dim, filler(), text(positions[cs_data["enemy"]["pick"][i]["position"]] + " ") | dim, text(positions[cs_data["enemy"]["pick"][i]["position"]]));
 
 			} else {
-				enemy_picks.push_back(hbox(pick_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["title"])) | dim));
+				enemy_picks[cs_data["enemy"]["hover"][i]["cellID"]] = hbox(pick_spinner(false), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["name"])), text(" "), text(std::string(champion_data[std::to_string(int(cs_data["enemy"]["hover"][i]["championID"]))]["title"])) | dim, filler(), text(positions[cs_data["enemy"]["pick"][i]["position"]] + " ") | dim, text(positions[cs_data["enemy"]["pick"][i]["position"]]));
 			}
 		}
-		for(int i = 0; i <= 5; i++) {
-			if(ally_bans.size() < i) ally_bans.push_back(text("                                         "));
-			if(ally_picks.size() < i) ally_picks.push_back(text("                                         "));
-			if(enemy_bans.size() < i) enemy_bans.push_back(text("                                         "));
-			if(enemy_picks.size() < i) enemy_picks.push_back(text("                                         "));
-		}
+
 		if(champ_sel) {
 			return vbox(hbox(window(hbox(text("Ally"), text("")) | color(Color::DarkSeaGreen2), 
 				vbox(
