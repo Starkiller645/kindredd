@@ -28,10 +28,11 @@
 
 extern const std::string LOGO_K, LOGO_d, LOGO_D;
 extern const std::string champion_data_str;
+const nlohmann::json champion_data = nlohmann::json::parse(champion_data_str);
 
 sig_atomic_t signalled = 0;
 
-const std::string version = "v0.5.2";
+const std::string version = "alpha-prerelease-1.0";
 const std::string lamb_url_base = "https://lamb.jacobtye.dev";
 
 #ifdef __linux__
@@ -239,7 +240,7 @@ void sendupdate() {
 	}
 	gamedata["ally"]["kills"] = int(ally_kills);
 	gamedata["enemy"]["kills"] = int(enemy_kills);
-	gamedata["event"] = "update";
+	gamedata["event"] = "live/update";
 	std::time_t time_now = time(nullptr);
 	gamedata["time"] = time_now - start_time;
 	current_json_data = gamedata.dump(4);
@@ -365,11 +366,15 @@ int champ_select() {
 				cellID = enemy_team[a["actorCellId"]];
 			}
 			if (champID > 0) {
+				nlohmann::json champion = champion_data[std::to_string(int(champID))];
+				std::string champion_name = champion["name"];
+
 				final_json[team][std::string(
 						     actions[i]["type"])]
 				    .push_back(
 					{{"position", position},
 					 {"championID", champID},
+					 {"championName", champion_name},
 					 {"type",
 					  std::string(actions[i]["type"])},
 					 {"cellID", cellID},
@@ -614,7 +619,6 @@ int main(int argc, const char* argv[]) {
 	sa.sa_handler = handle_sigint;
 	sa.sa_flags = 0;
 	signal(SIGINT, handle_sigint);
-	nlohmann::json champion_data = nlohmann::json::parse(champion_data_str);
 	// std::cout << champion_data.dump(4) << std::endl;
 	// return 0;
 	auto screen = ScreenInteractive::Fullscreen();
